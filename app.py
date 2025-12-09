@@ -1,147 +1,252 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
 import sqlite3
-import matplotlib.pyplot as plt
-from sklearn.inspection import permutation_importance
+import json
+import datetime
+import io
 import smtplib
 from email.mime.text import MIMEText
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
-import os
-from datetime import datetime
 
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.inspection import permutation_importance
+
+
+# ---------------- APP SETTINGS ----------------
 st.set_page_config(page_title="Student Outcome Prediction", layout="wide")
+DATA_PATH = "data 2.csv"   # your dataset file name
 
-# --------------------- Load Model ---------------------
-MODEL_PATH = "models/model.pkl"  # change if different
-model = joblib.load(MODEL_PATH)
 
-FEATURES = ['Age', 'Previous_Qualification_Grade', 'Admission_Grade',
-            'Curricular_Units_1st_Sem_Appr', 'Curricular_Units_1st_Sem_Grade',
-            'Curricular_Units_2nd_Sem_Appr', 'Curricular_Units_2nd_Sem_Grade',
-            'Scholarship_Holder', 'Unemployment_Rate', 'Inflation_Rate', 'GDP']
-
-# --------------------- Database Setup ---------------------
-DB_FILE = "predictions.db"
-conn = sqlite3.connect(DB_FILE)
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS history (
-    timestamp TEXT,
-    student_name TEXT,
-    email TEXT,
-    prediction TEXT
-)
-""")
-conn.commit()
-
-# --------------------- Input UI ---------------------
-st.title("🎓 Student Outcome Prediction Dashboard")
-
-col1, col2, col3 = st.columns(3)
-student_name = col1.text_input("Student Name")
-email_address = col2.text_input("Email Address")
-age = col3.number_input("Age", 16, 50)
-
-prev_grade = st.number_input("Previous Qualification Grade", 0, 200)
-admission_grade = st.number_input("Admission Grade", 0, 200)
-sem1_appr = st.number_input("Curricular Units 1st Sem Approved", 0, 20)
-sem1_grade = st.number_input("Curricular Units 1st Sem Grade", 0, 20)
-sem2_appr = st.number_input("Curricular Units 2nd Sem Approved", 0, 20)
-sem2_grade = st.number_input("Curricular Units 2nd Sem Grade", 0, 20)
-scholar = st.selectbox("Scholarship Holder", [0, 1])
-unemployment = st.number_input("Unemployment Rate", 0.0, 50.0)
-inflation = st.number_input("Inflation Rate", 0.0, 50.0)
-gdp = st.number_input("GDP (Billion USD)", 0.0, 50000.0)
-
-# --------------------- Prediction ---------------------
-if st.button("🔮 Predict Outcome"):
-    input_df = pd.DataFrame([[
-        age, prev_grade, admission_grade,
-        sem1_appr, sem1_grade,
-        sem2_appr, sem2_grade,
-        scholar, unemployment, inflation, gdp
-    ]], columns=FEATURES)
-
-    pred = model.predict(input_df)[0]
-    outcome = {0: "Graduate", 1: "Dropout", 2: "Enrolled"}.get(pred, "Unknown")
-
-    st.success(f"🎓 Prediction: {outcome}")
-
-    # Save to DB
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("INSERT INTO history VALUES (?, ?, ?, ?)",
-                   (timestamp, student_name, email_address, outcome))
-    conn.commit()
-
-    st.write("---")
-    st.subheader("📌 Prediction Explanation (Feature Importance)")
-
-    try:
-        # Compute permutation importance
-        result = permutation_importance(
-            model,
-            input_df,
-            model.predict(input_df),
-            n_repeats=5,
-            random_state=42
+# ---------------- DATABASE ----------------
+@st.cache_resource
+def get_connection():
+    con = sqlite3.connect("predictions.db", check_same_thread=False)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            predicted_label TEXT,
+            model_used TEXT,
+            inputs_json TEXT
         )
-        importance = pd.DataFrame({
-            "Feature": FEATURES,
-            "Importance": result.importances_mean
-        }).sort_values("Importance", ascending=False)
+    """)
+    con.commit()
+    return con
 
-        st.bar_chart(importance.set_index("Feature")["Importance"])
 
-    except Exception as e:
-        st.warning("Explanation unavailable for this prediction.")
-        st.text(str(e))
+# ---------------- LOAD & PREPROCESS DATA ----------------
+@st.cache_data
+def load_data(path):
+    df = pd.read_csv(path, sep=";")
+    df = df.copy()
+    df = df.dropna(subset=["Target"])
+    df = df.reset_index(drop=True)
+    return df
 
-# --------------------- Prediction History ---------------------
-st.write("---")
-st.subheader("📅 Prediction History")
 
-cursor.execute("SELECT * FROM history")
-rows = cursor.fetchall()
-history_df = pd.DataFrame(rows, columns=["Time", "Name", "Email", "Prediction"])
-st.dataframe(history_df)
+def get_features(df):
+    return [c for c in df.columns if c not in ["Target", "id", "Unnamed: 0"]]
 
-# --------------------- PDF Generator ---------------------
-def generate_pdf(name, prediction):
-    filename = f"{name}_prediction.pdf"
-    c = canvas.Canvas(filename, pagesize=A4)
-    c.drawString(100, 780, "Student Outcome Prediction Report")
-    c.drawString(100, 750, f"Student Name: {name}")
-    c.drawString(100, 720, f"Prediction: {prediction}")
-    c.save()
-    return filename
 
-if st.button("📄 Download Prediction PDF"):
-    if student_name:
-        pdf_file = generate_pdf(student_name, outcome)
-        with open(pdf_file, "rb") as f:
-            st.download_button("Download PDF", f, file_name=pdf_file)
-    else:
-        st.warning("Enter student name first.")
+# ---------------- TRAIN MODELS ----------------
+@st.cache_resource
+def train_all_models(path):
+    df = load_data(path)
+    features = get_features(df)
 
-# --------------------- Email Notification ---------------------
-if st.button("📧 Send Email Notification"):
-    try:
-        sender_email = st.secrets["EMAIL_ADDRESS"]
-        sender_pass = st.secrets["EMAIL_PASSWORD"]
-        msg = MIMEText(f"Student Name: {student_name}\nPrediction: {outcome}")
-        msg["Subject"] = "Student Outcome Prediction Result"
-        msg["From"] = sender_email
-        msg["To"] = email_address
+    # Encode labels
+    target_encoder = LabelEncoder()
+    df["Target"] = target_encoder.fit_transform(df["Target"])
+    y = df["Target"]
 
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login(sender_email, sender_pass)
-            server.sendmail(sender_email, email_address, msg.as_string())
+    # Encode categorical columns
+    for col in features:
+        if df[col].dtype == object:
+            df[col] = LabelEncoder().fit_transform(df[col].astype(str))
 
-        st.success("📨 Email sent successfully!")
-    except Exception as e:
-        st.error("Email failed. Add EMAIL_ADDRESS + EMAIL_PASSWORD in Secrets.")
-        st.text(str(e))
+    X = df[features].astype(float)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y)
+
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    scale_models = {"Logistic Regression", "KNN", "SVM", "Neural Network"}
+
+    models = {
+        "Logistic Regression": LogisticRegression(max_iter=2000),
+        "Decision Tree": DecisionTreeClassifier(max_depth=15),
+        "Random Forest": RandomForestClassifier(n_estimators=220, max_depth=25),
+        "KNN": KNeighborsClassifier(n_neighbors=12),
+        "SVM": SVC(kernel="rbf", probability=True),
+        "Neural Network": MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=600),
+    }
+
+    results, trained = [], {}
+    for name, model in models.items():
+        if name in scale_models:
+            model.fit(X_train_s, y_train)
+            preds = model.predict(X_test_s)
+        else:
+            model.fit(X_train, y_train)
+            preds = model.predict(X_test)
+
+        trained[name] = model
+        results.append({
+            "Model": name,
+            "Accuracy": accuracy_score(y_test, preds),
+            "Precision": precision_score(y_test, preds, average="weighted", zero_division=0),
+            "Recall": recall_score(y_test, preds, average="weighted", zero_division=0),
+            "F1 Score": f1_score(y_test, preds, average="weighted", zero_division=0),
+        })
+
+    results_df = pd.DataFrame(results).sort_values("Accuracy", ascending=False)
+
+    # Feature importance for best model
+    best_model_name = results_df.iloc[0]["Model"]
+    best_model = trained[best_model_name]
+    X_used = X_test_s if best_model_name in scale_models else X_test
+    perm = permutation_importance(best_model, X_used, y_test, n_repeats=8, random_state=42)
+
+    fi_df = pd.DataFrame({"Feature": features, "Importance": perm.importances_mean})
+    fi_df = fi_df.sort_values("Importance", ascending=False)
+
+    return {
+        "df": df,
+        "features": features,
+        "scaler": scaler,
+        "scale_models": scale_models,
+        "models": trained,
+        "results_df": results_df,
+        "target_encoder": target_encoder,
+        "feature_importance": fi_df
+    }
+
+
+# ---------------- MAIN APP ----------------
+def main():
+    st.title("🎓 Student Outcome Prediction Dashboard")
+
+    data = train_all_models(DATA_PATH)
+    df, features = data["df"], data["features"]
+
+    page = st.sidebar.radio("📌 Navigation", [
+        "Overview", "Model Performance", "Feature Importance", "Predict Outcome", "History"
+    ])
+
+    # ---------------- OVERVIEW ----------------
+    if page == "Overview":
+        st.subheader("📍 Dataset Preview")
+        st.dataframe(df.head())
+        st.write(f"📌 Total rows: **{len(df)}**")
+        st.bar_chart(df["Target"].value_counts())
+
+    # ---------------- MODEL PERFORMANCE ----------------
+    elif page == "Model Performance":
+        st.subheader("📌 ML Model Comparison")
+        st.dataframe(data["results_df"].style.highlight_max(axis=0))
+        st.success(f"🏆 Best Model: **{data['results_df'].iloc[0]['Model']}**")
+
+    # ---------------- FEATURE IMPORTANCE ----------------
+    elif page == "Feature Importance":
+        st.subheader("📌 Global Feature Importance (Permutation Importance)")
+        st.bar_chart(data["feature_importance"].set_index("Feature")["Importance"])
+        st.dataframe(data["feature_importance"].reset_index(drop=True))
+
+    # ---------------- PREDICT OUTCOME ----------------
+    elif page == "Predict Outcome":
+        st.subheader("🔮 Predict Student Outcome")
+
+        inputs = {}
+        for f in features:
+            default = float(df[f].mean())
+            inputs[f] = st.number_input(f, value=default)
+
+        model_name = st.selectbox("Select Model", list(data["models"].keys()))
+        model = data["models"][model_name]
+        needs_scaling = model_name in data["scale_models"]
+
+        if st.button("Predict"):
+            X_new = pd.DataFrame([inputs], columns=features)
+            if needs_scaling:
+                X_new = data["scaler"].transform(X_new)
+
+            pred = model.predict(X_new)[0]
+            label = data["target_encoder"].inverse_transform([pred])[0]
+            st.success(f"🎓 Predicted Result → **{label}**")
+
+            # store in database
+            con = get_connection()
+            con.execute(
+                "INSERT INTO predictions (timestamp, predicted_label, model_used, inputs_json) VALUES (?,?,?,?)",
+                (str(datetime.datetime.now()), label, model_name, json.dumps(inputs)),
+            )
+            con.commit()
+
+            # PDF export
+            pdf = io.BytesIO()
+            p = canvas.Canvas(pdf, pagesize=A4)
+            p.drawString(100, 800, "Student Outcome Prediction Report")
+            p.drawString(100, 780, f"Prediction: {label}")
+            p.drawString(100, 760, f"Model: {model_name}")
+            y = 730
+            for k, v in inputs.items():
+                p.drawString(100, y, f"{k}: {v}")
+                y -= 15
+            p.save()
+            pdf.seek(0)
+
+            st.download_button("⬇️ Download PDF", pdf, "prediction.pdf", mime="application/pdf")
+
+            # Explain prediction (global importance)
+            st.markdown("#### 🔍 Explanation (Feature Importance)")
+            st.bar_chart(data["feature_importance"].set_index("Feature")["Importance"])
+
+            # Email notification
+            st.markdown("#### 📧 Send Email Notification")
+            receiver = st.text_input("Recipient Email")
+            if receiver and st.button("Send Email"):
+                try:
+                    sender = st.secrets["EMAIL_ADDRESS"]
+                    password = st.secrets["EMAIL_PASSWORD"]
+                    body = f"Prediction: {label}\nModel: {model_name}\n\nInput values:\n{json.dumps(inputs, indent=2)}"
+                    msg = MIMEText(body)
+                    msg["Subject"] = "Student Prediction Result"
+                    msg["From"] = sender
+                    msg["To"] = receiver
+
+                    with smtplib.SMTP("smtp.gmail.com", 587) as s:
+                        s.starttls()
+                        s.login(sender, password)
+                        s.sendmail(sender, receiver, msg.as_string())
+                    st.success("📨 Email sent successfully!")
+                except Exception as e:
+                    st.error("Email sending failed.")
+                    st.text(str(e))
+
+    # ---------------- HISTORY ----------------
+    elif page == "History":
+        st.subheader("📁 Stored Prediction History")
+        con = get_connection()
+        df_history = pd.read_sql("SELECT * FROM predictions ORDER BY id DESC", con)
+        if df_history.empty:
+            st.info("No stored predictions yet.")
+        else:
+            st.dataframe(df_history)
+
+
+if __name__ == "__main__":
+    main()
