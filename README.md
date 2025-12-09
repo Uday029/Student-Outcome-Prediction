@@ -4,7 +4,7 @@ machine-learning data-science streamlit education dropout-prediction student-per
 
 End-to-End Machine Learning + Streamlit Dashboard
 
-🔗 Live App: https://your-username-student-outcome.streamlit.app  
+🔗 Live App: https://student-outcome-prediction-iopbem5ktkjq7hd5dgrc64.streamlit.app 
 
 
 📌 Project Overview
